@@ -10,115 +10,118 @@ from langchain_core.runnables.history import RunnableWithMessageHistory
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.document_loaders import PyPDFLoader
+import chromadb
 import os
 
 from dotenv import load_dotenv
 load_dotenv()
 
+# Ensure ChromaDB directory exists
+CHROMA_DB_PATH = "./chroma_db"
+if not os.path.exists(CHROMA_DB_PATH):
+    os.makedirs(CHROMA_DB_PATH)
+
+# Load environment variables
 os.environ['HF_TOKEN'] = os.getenv("HF_TOKEN")
+api_key = os.getenv("GROQ_API_KEY")
+
+# Initialize embeddings
 embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
 
 st.title("Dr. Bot: Your AI Medical Assistant")  
-st.caption("Upload PDFs and have a meaningful conversation with Dr. Bot, your AI-powered medical assistant. Get accurate, fact-based answers to your queries!")  
-
-api_key = os.getenv("GROQ_API_KEY")
+st.caption("Upload PDFs and get them summarized.")  
 
 if api_key:
-    llm = ChatGroq(groq_api_key=api_key, model_name="Gemma2-9b-It")
+    # Initialize LLM
+    llm = ChatGroq(groq_api_key=api_key, model_name="llama-3.3-70b-versatile")
 
-    ## chat interface
+    # Initialize ChromaDB client and collection
+    chroma_client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
+    vectorstore = Chroma(client=chroma_client, collection_name="medical_data", embedding_function=embeddings)
+    retriever = vectorstore.as_retriever()
+
+    # Session management
     session_id = st.text_input("Session ID", value="default_session")
 
     if 'store' not in st.session_state:
         st.session_state.store = {}
 
-    uploaded_files = st.file_uploader("Choose A PDF file", type="pdf", accept_multiple_files=True)
+    uploaded_files = st.file_uploader("Choose a PDF file", type="pdf", accept_multiple_files=True)
 
-    
     if uploaded_files:
         documents = []
         for uploaded_file in uploaded_files:
-            temppdf = f"./temp.pdf"
-            with open(temppdf, "wb") as file:
+            temp_pdf = "./temp.pdf"
+            with open(temp_pdf, "wb") as file:
                 file.write(uploaded_file.getvalue())
-                file_name = uploaded_file.name
 
-            loader = PyPDFLoader(temppdf)
+            loader = PyPDFLoader(temp_pdf)
             docs = loader.load()
             documents.extend(docs)
 
         text_splitter = RecursiveCharacterTextSplitter(chunk_size=5000, chunk_overlap=500)
         splits = text_splitter.split_documents(documents)
-        vectorstore = Chroma.from_documents(documents=splits, embedding=embeddings)
+
+        # Add documents to the existing ChromaDB collection
+        vectorstore.add_documents(splits)
+        
+        # Update retriever after adding new docs
         retriever = vectorstore.as_retriever()
 
-        contextualize_q_system_prompt = (
-            "Given a chat history and the latest user question"
-            "which might reference context in the chat history, "
-            "formulate a standalone question which can be understood "
-            "without the chat history. Do NOT answer the question, "
-            "just reformulate it if needed and otherwise return it as is."
-        )
-        contextualize_q_prompt = ChatPromptTemplate.from_messages(
-            [
-                ("system", contextualize_q_system_prompt),
-                MessagesPlaceholder("chat_history"),
-                ("human", "{input}"),
-            ]
-        )
+    # Prompt templates
+    contextualize_q_prompt = ChatPromptTemplate.from_messages([
+        ("system", "Given a chat history and the latest user question, rephrase it as a standalone question."),
+        MessagesPlaceholder("chat_history"),
+        ("human", "{input}"),
+    ])
 
-        history_aware_retriever = create_history_aware_retriever(llm, retriever, contextualize_q_prompt)
+    history_aware_retriever = create_history_aware_retriever(llm, retriever, contextualize_q_prompt)
 
-        system_prompt = (
-            "You are an medical assistant for question-answering tasks regarding medical domain and your name is Dr.Bot . "
-            "Use the following pieces of retrieved context to answer "
-            "the question. If you don't know the answer, say that you "
-            "don't know. Answer without hallucianations and answer consisely."
-            "You are a helpful and friendly medical assistant."
-            "You can answer questions related to medical conditions, treatments, and medications."
-            "Provide concise and factual information based on the context and avoid speculation."
-            "\n\n"
-            "{context}"
-        )
-        qa_prompt = ChatPromptTemplate.from_messages(
-            [
-                ("system", system_prompt),
-                MessagesPlaceholder("chat_history"),
-                ("human", "{input}"),
-            ]
-        )
+    system_prompt = (
+        "You are a medical chatbot named Dr. Bot. "
+        "Your task is to summarize the provided medical documents and answer health-related questions. "
+        "Provide factual, well-researched, and human-like responses based on the retrieved context. "
+        "Do not hallucinate or speculate. If you do not know an answer, say so. "
+        "You are a friendly and professional medical assistant."
+        "\n\n{context}"
+    )
 
-        question_answer_chain = create_stuff_documents_chain(llm, qa_prompt)
-        rag_chain = create_retrieval_chain(history_aware_retriever, question_answer_chain)
+    qa_prompt = ChatPromptTemplate.from_messages([
+        ("system", system_prompt),
+        MessagesPlaceholder("chat_history"),
+        ("human", "{input}"),
+    ])
 
-        def get_session_history(session: str) -> BaseChatMessageHistory:
-            if session_id not in st.session_state.store:
-                st.session_state.store[session_id] = ChatMessageHistory()
-            return st.session_state.store[session_id]
+    question_answer_chain = create_stuff_documents_chain(llm, qa_prompt)
+    rag_chain = create_retrieval_chain(history_aware_retriever, question_answer_chain)
 
-        conversational_rag_chain = RunnableWithMessageHistory(
-            rag_chain, get_session_history,
-            input_messages_key="input",
-            history_messages_key="chat_history",
-            output_messages_key="answer"
+    def get_session_history(session: str) -> BaseChatMessageHistory:
+        if session_id not in st.session_state.store:
+            st.session_state.store[session_id] = ChatMessageHistory()
+        return st.session_state.store[session_id]
+
+    conversational_rag_chain = RunnableWithMessageHistory(
+        rag_chain, get_session_history,
+        input_messages_key="input",
+        history_messages_key="chat_history",
+        output_messages_key="answer"
+    )
+
+    # User input for chat
+    user_input = st.text_input("Your question:")
+    if user_input:
+        session_history = get_session_history(session_id)
+        response = conversational_rag_chain.invoke(
+            {"input": user_input},
+            config={"configurable": {"session_id": session_id}}
         )
 
-        user_input = st.text_input("Your question:")
-        if user_input:
-            session_history = get_session_history(session_id)
-            response = conversational_rag_chain.invoke(
-                {"input": user_input},
-                config={
-                    "configurable": {"session_id": session_id}
-                },  # constructs a key "abc123" in `store`.
-            )
+        st.write("Dr. Bot:", response['answer'])
 
-            st.write("Dr. Bot:", response['answer'])
-
-            # Add Expander for chat history and context
-            with st.expander("View Chat History and Context"):
-                st.write("Chat History:", session_history.messages)
-                st.write("Retrieved Context:", response.get("context", "No context available"))
+        # Expandable chat history and retrieved context
+        with st.expander("View Chat History and Context"):
+            st.write("Chat History:", session_history.messages)
+            st.write("Retrieved Context:", response.get("context", "No context available"))
 
 else:
-    st.warning("Please enter the query.")
+    st.warning("Please enter a valid API key in your environment variables.")
